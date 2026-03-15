@@ -1,0 +1,12 @@
+# Project Debug Rules (Non-Obvious Only)
+- Debug state names require FSM_ENABLE_DEBUG=1 and must be set via fsm_set_state_names() before fsm_get_state_name() returns meaningful strings
+- Without FSM_ENABLE_DEBUG, fsm_get_state_name() returns NULL and state names table is not allocated
+- The state names array must be null-terminated (last element should be NULL)
+- Debug features increase memory usage: state names table adds ~6B per state instance
+- Assertions behavior: when FSM_ENABLE_ASSERT=0, only error codes are returned without FSM_BREAK() trapping
+- When both FSM_ENABLE_ASSERT=0 and NDEBUG are defined, assertions are completely disabled
+- In HSM mode, the hsm_cbs_fired flag prevents double callbacks during transitions - don't manually modify this flag
+- The trace buffer is circular and overwrites oldest entries when full - recent traces may be lost
+- Event queue is also circular and will drop oldest events when full
+- Timeout checking happens in fsm_step() - if you don't call fsm_step() regularly, timeouts won't trigger
+- The state_changed flag is reset in fsm_handle_state_entry() - reading it after fsm_step() but before state entry processing may give stale results

@@ -1,0 +1,11 @@
+# Project Coding Rules (Non-Obvious Only)
+- Always initialize user data before passing to fsm_init() - NULL user data will cause handlers to return current state unchanged
+- When using condition functions for transitions, they must be static or global - local function pointers will cause undefined behavior
+- State handler functions must return the next state or current state - returning invalid state IDs will cause FSM_ERROR_INVALID_STATE
+- The FSM_COND_ALWAYS sentinel is globally unique - do not attempt to create local copies or redefine it
+- When using HSM (FSM_ENABLE_HSM=1), parent relationships must be acyclic - circular parent chains will be detected and rejected
+- Timeout callbacks require the tick function to be set BEFORE adding timeouts - order matters for proper initialization
+- Event queue functions are only available when FSM_ENABLE_EVENT_QUEUE=1 - calling them when disabled returns FSM_EVENT_NONE without error
+- State names must be set via fsm_set_state_names() BEFORE calling fsm_get_state_name() - otherwise returns NULL
+- Statistics and trace functions require their respective features to be enabled at compile time - linking will fail if used when disabled
+- Assertions behavior changes based on FSM_ENABLE_ASSERT and NDEBUG - when both disabled, only error codes are returned without trapping

@@ -1,0 +1,24 @@
+# Project Architecture Rules (Non-Obvious Only)
+- HSM parent relationships must be established before using the state machine for proper transition inheritance
+- Timeout functionality requires both setting a tick function AND adding timeouts to individual states
+- Event queue size must be power of 2 and between 2-128 (enforced by static_assert)
+- Trace buffer size must be between 2-128 (enforced by static_assert)
+- FSM_MAX_STATES must be between 2-254 when HSM is used (0xFF reserved for no parent)
+- Feature gates via #if blocks; disabled features omit code entirely (zero overhead when not used)
+- HSM enables transition inheritance: if no transition in current state, searches parent chain
+- LCA (Lowest Common Ancestor) algorithm determines exit/entry chain boundaries in HSM
+- HSM entry/exit order: on_exit bottom-up, on_entry top-down (strict UML semantics)
+- Circular parent chain detection in HSM prevents infinite loops during initialization
+- FSM_HSM_NO_PARENT (0xFF) is used as root state sentinel and never conflicts with valid states
+- User data pattern: define struct, pass to fsm_init(), retrieve via fsm_get_user_data()
+- State handler functions must return next state or current state - invalid returns cause FSM_ERROR_INVALID_STATE
+- Condition functions for transitions must be static/global - local function pointers cause undefined behavior
+- FSM_COND_ALWAYS sentinel is globally unique - do not create local copies
+- Assertions behavior: when FSM_ENABLE_ASSERT=0 and NDEBUG defined, only error codes returned without trapping
+- In HSM mode, the hsm_cbs_fired flag prevents double callbacks during transitions
+- The trace buffer is circular and overwrites oldest entries when full
+- Event queue is also circular and will drop oldest events when full
+- Timeout checking happens in fsm_step() - if you don't call fsm_step() regularly, timeouts won't trigger
+- The state_changed flag is reset in fsm_handle_state_entry() - reading it after fsm_step() but before state entry processing may give stale results
+- Self-transitions (target == current_state) are always allowed and don't trigger exit/entry callbacks
+- Parent chain depth is limited to FSM_HSM_MAX_DEPTH to prevent infinite loops from circular references

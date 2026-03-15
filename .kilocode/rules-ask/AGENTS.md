@@ -1,0 +1,18 @@
+# Project Documentation Rules (Non-Obvious Only)
+- The example in fsm_example.c demonstrates a traffic light FSM but the core library is generic
+- State handler functions receive a fsm_context_t* parameter but may not use it (see traffic_light_off_handler)
+- User data is passed via void* and must be cast to the appropriate type in handlers
+- The FSM_COND_ALWAYS sentinel is defined externally in fsm.c and should not be redefined locally
+- Debug state names require setting via fsm_set_state_names() before they can be retrieved - returns NULL if not set
+- Event queue functions return FSM_EVENT_NONE when the feature is disabled at compile time
+- HSM parent relationships must be established before using the state machine for proper transition inheritance
+- Timeout functionality requires both setting a tick function AND adding timeouts to individual states
+- In HSM mode, transition lookup searches parent chain if not found in current state (transition inheritance)
+- The hsm_cbs_fired flag is set during HSM transitions to prevent double callback execution
+- State entry/exit callbacks in HSM follow specific order: exit bottom-up, entry top-down (UML semantics)
+- The trace buffer stores trigger_event only when both FSM_ENABLE_TRACE and FSM_ENABLE_EVENT_QUEUE are enabled
+- Statistics tracking requires FSM_ENABLE_STATS and records enter_count, total_ticks, max_ticks, min_ticks per state
+- The FSM_HSM_NO_PARENT sentinel (0xFF) is used for root states and won't conflict with valid state IDs (0-253)
+- Parent chain depth is limited to FSM_HSM_MAX_DEPTH to prevent infinite loops from circular references
+- Self-transitions (target == current_state) are always allowed and don't trigger exit/entry callbacks
+- The state_changed flag is set during transitions and cleared in fsm_handle_state_entry()
