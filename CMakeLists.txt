@@ -16,11 +16,12 @@ set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
 # Find all source files
 set(FSM_SOURCES
     fsm.c
-    fsm_example.c
+    pubg_fsm.c
 )
 
-# Create the executable
+# Create the example executables
 add_executable(fsm_example ${FSM_SOURCES})
+add_executable(fsm_pubg_example fsm.c pubg_fsm.c)
 
 # Optional: Define configuration options via command line
 # Usage: cmake -B build -DFSM_ENABLE_DEBUG=0
@@ -31,9 +32,9 @@ option(FSM_ENABLE_CALLBACKS "Enable state callbacks" ON)
 option(FSM_ENABLE_EVENT_QUEUE "Enable event queue" ON)
 option(FSM_ENABLE_ASSERT "Enable assertions" ON)
 
-# Set FSM_MAX_STATES for larger state machines
+# Set FSM_MAX_STATES for larger state machines (required for complex examples)
 if(NOT FSM_MAX_STATES)
-    set(FSM_MAX_STATES 16)
+    set(FSM_MAX_STATES 32)
 endif()
 
 # Pass configuration to compiler
@@ -47,17 +48,21 @@ endif()
 
 if(NOT FSM_ENABLE_CALLBACKS)
     target_compile_definitions(fsm_example PRIVATE FSM_ENABLE_CALLBACKS=0)
+    target_compile_definitions(fsm_pubg_example PRIVATE FSM_ENABLE_CALLBACKS=0)
 endif()
 
 if(NOT FSM_ENABLE_EVENT_QUEUE)
     target_compile_definitions(fsm_example PRIVATE FSM_ENABLE_EVENT_QUEUE=0)
+    target_compile_definitions(fsm_pubg_example PRIVATE FSM_ENABLE_EVENT_QUEUE=0)
 endif()
 
 if(NOT FSM_ENABLE_ASSERT)
     target_compile_definitions(fsm_example PRIVATE FSM_ENABLE_ASSERT=0)
+    target_compile_definitions(fsm_pubg_example PRIVATE FSM_ENABLE_ASSERT=0)
 endif()
 
 target_compile_definitions(fsm_example PRIVATE FSM_MAX_STATES=${FSM_MAX_STATES})
+target_compile_definitions(fsm_pubg_example PRIVATE FSM_MAX_STATES=${FSM_MAX_STATES})
 
 # Print configuration info
 message(STATUS "FSM Configuration:")

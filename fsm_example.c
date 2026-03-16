@@ -1,865 +1,681 @@
 /**
- * @file    fsm_example.c
- * @brief   游戏角色状态机示例 - 使用层次化状态机 (HSM)
- * @version 2.1.0
+ * @file    fsm_hsm_test.c
+ * @brief   FSM v2.1 层次化状态机（HSM）全功能验证测试
  *
- * 本示例展示如何使用 FSM 框架的 HSM (Hierarchical State Machine) 功能。
- * 场景：游戏角色状态管理
+ * 测试场景：电机控制器状态机（三层层级）
  *
- * 层次结构：
- * [ALIVE] (存活) - 父状态
- *   ├── [IDLE] (站立)
- *   ├── [MOVING] (移动) - 父状态
- *   │   ├── [WALKING] (行走)
- *   │   └── [RUNNING] (奔跑)
- *   ├── [ATTACKING] (攻击) - 父状态
- *   │   ├── [MELEE] (近战攻击)
- *   │   └── [RANGED] (远程攻击)
- *   └── [DEFENDING] (防御) - 父状态
- *       ├── [BLOCKING] (格挡)
- *       └── [DODGING] (闪避)
+ * 层级结构：
  *
- * [DEAD] (死亡) - 父状态
- *   └── [DYING] (濒死/等待复活)
+ *   TOP（虚根，depth=0，不分配 handler，作为 transition 兜底层）
+ *   ├── OPERATIONAL（depth=1，复合状态，管理正常运行逻辑）
+ *   │   ├── IDLE（depth=2，叶子，等待启动指令）
+ *   │   └── RUN（depth=2，叶子，运行中）
+ *   └── FAULT（depth=1，叶子，故障处理）
+ *
+ * Transition 配置：
+ *   TOP       → FAULT       : NULL（无条件，所有子状态继承此故障转换）
+ *   IDLE      → RUN         : cond_run_ok（条件：无故障且收到启动事件）
+ *   RUN       → IDLE        : NULL（无条件，收到停止指令）
+ *   OPERATIONAL → FAULT     : 覆盖 TOP 的故障转换（条件相同，但在 OPERATIONAL 层定义）
+ *   FAULT     → OPERATIONAL : NULL（恢复后返回 OPERATIONAL，进入其默认子状态）
+ *
+ * 验证项目：
+ *   [T01] 基础层级注册（set_parent / get_depth / is_ancestor）
+ *   [T02] LCA 计算正确性
+ *   [T03] 转换继承：IDLE 通过父链 OPERATIONAL 继承 → FAULT 转换
+ *   [T04] on_exit 退出链顺序（bottom-up）：IDLE → OPERATIONAL → (LCA=TOP 不触发)
+ *   [T05] on_entry 进入链顺序（top-down）：FAULT 直接子 TOP，只触发 FAULT
+ *   [T06] LCA = OPERATIONAL 时的 IDLE → RUN：只触发 exit(IDLE)、entry(RUN)
+ *   [T07] 转换继承优先级：子状态条件 false 时不向父继承
+ *   [T08] fsm_request_transition() 在 HSM 模式下触发正确的退出/进入链
+ *   [T09] 超时 + HSM：FAULT 超时后 HSM-aware 跳转回 OPERATIONAL
+ *   [T10] fsm_reset() 保留 parent 配置
+ *   [T11] 循环父链检测
+ *   [T12] v2.0 兼容性：FSM_ENABLE_HSM=1 下 stats、trace、event queue 仍正常工作
  */
 
 #include "fsm.h"
+#include <assert.h>
 #include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <time.h>
+#include <string.h>
+
+/* NDEBUG を無効化する独自 assert（標準 TEST_ASSERT() は NDEBUG で無効化されるため）*/
+#define TEST_ASSERT(expr) \
+    do { \
+        if (!(expr)) { \
+            fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, #expr); \
+            __builtin_trap(); \
+        } \
+    } while (0)
 
 /*============================================================================
- * 游戏角色状态机实例 - 层次化状态机 (HSM)
+ * 状态定义
  *============================================================================*/
-
-/**
- * @brief 角色状态定义 (使用 HSM 层次结构)
- */
 typedef enum
 {
-    /* --- 存活分支 --- */
-    CHAR_ALIVE = 0,        /**< 存活状态 (父状态) */
-    CHAR_IDLE,             /**< 站立/休息 */
-    CHAR_MOVING,           /**< 移动中 (父状态) */
-    CHAR_WALKING,          /**< 行走 */
-    CHAR_RUNNING,          /**< 奔跑 */
-    CHAR_ATTACKING,        /**< 攻击中 (父状态) */
-    CHAR_MELEE,            /**< 近战攻击 */
-    CHAR_RANGED,           /**< 远程攻击 */
-    CHAR_DEFENDING,        /**< 防御中 (父状态) */
-    CHAR_BLOCKING,         /**< 格挡 */
-    CHAR_DODGING,          /**< 闪避 */
+    ST_TOP         = 0,
+    ST_OPERATIONAL = 1,
+    ST_IDLE        = 2,
+    ST_RUN         = 3,
+    ST_FAULT       = 4,
+    ST_COUNT
+} motor_state_t;
 
-    /* --- 死亡分支 --- */
-    CHAR_DEAD,             /**< 死亡状态 (父状态) */
-    CHAR_DYING,            /**< 濒死状态 */
-
-    /* --- 元数据 --- */
-    CHAR_STATE_COUNT       /**< 状态总数 */
-} character_state_t;
-
-/**
- * @brief 角色事件定义
- */
-typedef enum
+static const char * const STATE_NAMES[] =
 {
-    CHAR_EVENT_NONE = 0,       /**< 无事件 */
-    CHAR_EVENT_IDLE,            /**< 停止移动 */
-    CHAR_EVENT_WALK,            /**< 开始行走 */
-    CHAR_EVENT_RUN,             /**< 开始奔跑 */
-    CHAR_EVENT_STOP_MOVING,     /**< 停止移动 */
-    CHAR_EVENT_ATTACK_MELEE,    /**< 近战攻击 */
-    CHAR_EVENT_ATTACK_RANGED,   /**< 远程攻击 */
-    CHAR_EVENT_ATTACK_DONE,     /**< 攻击完成 */
-    CHAR_EVENT_BLOCK,           /**< 开始格挡 */
-    CHAR_EVENT_DODGE,           /**< 开始闪避 */
-    CHAR_EVENT_DEFEND_DONE,     /**< 防御结束 */
-    CHAR_EVENT_TAKE_DAMAGE,     /**< 受到伤害 */
-    CHAR_EVENT_DIE,             /**< 死亡 */
-    CHAR_EVENT_RESPAWN,         /**< 复活 */
-    CHAR_EVENT_HURT             /**< 受伤 (攻击时) */
-} character_event_t;
+    "TOP", "OPERATIONAL", "IDLE", "RUN", "FAULT"
+};
 
-/**
- * @brief 角色用户数据结构
- */
+/*============================================================================
+ * 事件定义
+ *============================================================================*/
+#define EV_START  ((fsm_event_t)0x01U)
+#define EV_STOP   ((fsm_event_t)0x02U)
+#define EV_FAULT  ((fsm_event_t)0x03U)
+#define EV_CLEAR  ((fsm_event_t)0x04U)
+
+/*============================================================================
+ * 用户数据
+ *============================================================================*/
 typedef struct
 {
-    uint32_t health;           /**< 生命值 */
-    uint32_t max_health;       /**< 最大生命值 */
-    uint32_t stamina;           /**< 体力 */
-    uint32_t max_stamina;       /**< 最大体力 */
-    uint32_t action_timer;      /**< 动作计时器 */
-    uint32_t damage;            /**< 伤害值 */
-    bool is_alive;              /**< 是否存活 */
-    bool in_combat;             /**< 是否在战斗中 */
-} character_data_t;
+    bool     fault_active;
+    bool     run_requested;
+    uint32_t run_cycles;
+} motor_ctx_t;
+
+static motor_ctx_t g_motor;
 
 /*============================================================================
- * 状态处理器函数
+ * Tick 模拟
  *============================================================================*/
+static uint32_t g_tick = 0U;
+static uint32_t mock_tick(void) { return g_tick; }
 
-/**
- * @brief 站立状态处理器
- */
-static fsm_state_t character_idle_handler(fsm_context_t *ctx)
+/*============================================================================
+ * 退出/进入回调日志（用于验证顺序）
+ *============================================================================*/
+#define LOG_MAX 32
+
+static char  g_log[LOG_MAX][32];
+static int   g_log_count = 0;
+
+static void log_reset(void)
 {
-    character_data_t *data = (character_data_t *)fsm_get_user_data(ctx);
-
-    if (data == NULL)
-    {
-        return CHAR_IDLE;
-    }
-
-    /* 检查是否死亡 */
-    if (!data->is_alive)
-    {
-        return CHAR_DYING;
-    }
-
-    printf("🎮 角色站立等待\n");
-    data->action_timer++;
-
-    /* 检查事件 */
-    fsm_event_t event = fsm_get_current_event(ctx);
-
-    /* 死亡事件 */
-    if (event == CHAR_EVENT_DIE)
-    {
-        data->action_timer = 0;
-        data->health = 0;
-        data->is_alive = false;
-        return CHAR_DYING;
-    }
-
-    /* 受伤事件 */
-    if (event == CHAR_EVENT_TAKE_DAMAGE)
-    {
-        data->action_timer = 0;
-        if (data->health > 20)
-        {
-            data->health -= 20;
-            printf("💥 受到伤害！剩余生命: %u\n", data->health);
-            return CHAR_BLOCKING; /* 切换到格挡姿态 */
-        }
-        else
-        {
-            printf("💀 生命值过低！\n");
-            return CHAR_DYING; /* 进入濒死状态 */
-        }
-    }
-
-    return CHAR_IDLE; /* 保持站立状态 */
+    g_log_count = 0;
+    memset(g_log, 0, sizeof(g_log));
 }
 
-/**
- * @brief 行走状态处理器
- */
-static fsm_state_t character_walking_handler(fsm_context_t *ctx)
+static void log_push(const char *prefix, fsm_state_t state, const fsm_context_t *ctx)
 {
-    character_data_t *data = (character_data_t *)fsm_get_user_data(ctx);
-
-    if (data == NULL)
+    if (g_log_count < LOG_MAX)
     {
-        return CHAR_WALKING;
+        snprintf(g_log[g_log_count], 32, "%s(%s)",
+                 prefix, fsm_get_state_name(ctx, state));
+        g_log_count++;
     }
-
-    printf("🚶 角色行走中\n");
-    data->action_timer++;
-    data->stamina = (data->stamina > 0) ? data->stamina - 1 : 0;
-
-    fsm_event_t event = fsm_get_current_event(ctx);
-
-    /* 停止移动 */
-    if (event == CHAR_EVENT_STOP_MOVING || data->stamina == 0)
-    {
-        data->action_timer = 0;
-        return CHAR_IDLE;
-    }
-
-    /* 奔跑 */
-    if (event == CHAR_EVENT_RUN && data->stamina > 20)
-    {
-        data->action_timer = 0;
-        return CHAR_RUNNING;
-    }
-
-    /* 受伤 */
-    if (event == CHAR_EVENT_TAKE_DAMAGE)
-    {
-        data->action_timer = 0;
-        if (data->health > 20)
-        {
-            data->health -= 20;
-            return CHAR_DEFENDING;
-        }
-        else
-        {
-            return CHAR_DYING;
-        }
-    }
-
-    return CHAR_WALKING;
 }
 
-/**
- * @brief 奔跑状态处理器
- */
-static fsm_state_t character_running_handler(fsm_context_t *ctx)
+static void on_exit_cb(fsm_context_t *ctx, fsm_state_t state)
 {
-    character_data_t *data = (character_data_t *)fsm_get_user_data(ctx);
-
-    if (data == NULL)
-    {
-        return CHAR_RUNNING;
-    }
-
-    printf("🏃 角色奔跑中\n");
-    data->action_timer++;
-    data->stamina = (data->stamina > 0) ? data->stamina - 3 : 0;
-
-    fsm_event_t event = fsm_get_current_event(ctx);
-
-    /* 体力不足或停止 */
-    if (event == CHAR_EVENT_STOP_MOVING || data->stamina == 0)
-    {
-        data->action_timer = 0;
-        return CHAR_WALKING;
-    }
-
-    /* 受伤 */
-    if (event == CHAR_EVENT_TAKE_DAMAGE)
-    {
-        data->action_timer = 0;
-        if (data->health > 20)
-        {
-            data->health -= 20;
-            return CHAR_BLOCKING;
-        }
-        else
-        {
-            return CHAR_DYING;
-        }
-    }
-
-    return CHAR_RUNNING;
+    log_push("EXIT", state, ctx);
 }
 
-/**
- * @brief 近战攻击状态处理器
- */
-static fsm_state_t character_melee_handler(fsm_context_t *ctx)
+static void on_entry_cb(fsm_context_t *ctx, fsm_state_t state)
 {
-    character_data_t *data = (character_data_t *)fsm_get_user_data(ctx);
-
-    if (data == NULL)
-    {
-        return CHAR_MELEE;
-    }
-
-    printf("⚔️ 角色进行近战攻击！\n");
-    data->action_timer++;
-    data->stamina = (data->stamina > 0) ? data->stamina - 15 : 0;
-    data->in_combat = true;
-
-    /* 攻击完成 */
-    if (data->action_timer >= 3)
-    {
-        data->action_timer = 0;
-        printf("💥 近战攻击造成 %u 点伤害！\n", data->damage);
-        return CHAR_IDLE;
-    }
-
-    return CHAR_MELEE;
-}
-
-/**
- * @brief 远程攻击状态处理器
- */
-static fsm_state_t character_ranged_handler(fsm_context_t *ctx)
-{
-    character_data_t *data = (character_data_t *)fsm_get_user_data(ctx);
-
-    if (data == NULL)
-    {
-        return CHAR_RANGED;
-    }
-
-    printf("🏹 角色进行远程攻击！\n");
-    data->action_timer++;
-    data->stamina = (data->stamina > 0) ? data->stamina - 10 : 0;
-    data->in_combat = true;
-
-    /* 攻击完成 */
-    if (data->action_timer >= 5)
-    {
-        data->action_timer = 0;
-        printf("💥 远程攻击造成 %u 点伤害！\n", data->damage);
-        return CHAR_IDLE;
-    }
-
-    return CHAR_RANGED;
-}
-
-/**
- * @brief 格挡状态处理器
- */
-static fsm_state_t character_blocking_handler(fsm_context_t *ctx)
-{
-    character_data_t *data = (character_data_t *)fsm_get_user_data(ctx);
-
-    if (data == NULL)
-    {
-        return CHAR_BLOCKING;
-    }
-
-    /* 检查是否死亡 */
-    if (!data->is_alive)
-    {
-        return CHAR_DYING;
-    }
-
-    printf("🛡️ 角色正在格挡！\n");
-    data->action_timer++;
-    data->stamina = (data->stamina > 0) ? data->stamina - 5 : 0;
-
-    fsm_event_t event = fsm_get_current_event(ctx);
-
-    /* 死亡事件 */
-    if (event == CHAR_EVENT_DIE)
-    {
-        data->action_timer = 0;
-        data->health = 0;
-        data->is_alive = false;
-        return CHAR_DYING;
-    }
-
-    /* 防御结束 */
-    if (event == CHAR_EVENT_DEFEND_DONE || data->stamina == 0)
-    {
-        data->action_timer = 0;
-        return CHAR_IDLE;
-    }
-
-    /* 受伤时减少格挡时间 */
-    if (event == CHAR_EVENT_TAKE_DAMAGE)
-    {
-        data->action_timer = 0;
-        data->health = (data->health > 5) ? data->health - 5 : 0; /* 格挡减少伤害 */
-        printf("🛡️ 格挡成功！剩余生命: %u\n", data->health);
-    }
-
-    return CHAR_BLOCKING;
-}
-
-/**
- * @brief 闪避状态处理器
- */
-static fsm_state_t character_dodging_handler(fsm_context_t *ctx)
-{
-    character_data_t *data = (character_data_t *)fsm_get_user_data(ctx);
-
-    if (data == NULL)
-    {
-        return CHAR_DODGING;
-    }
-
-    printf("💨 角色正在闪避！\n");
-    data->action_timer++;
-    data->stamina = (data->stamina > 0) ? data->stamina - 20 : 0;
-    data->in_combat = true;
-
-    /* 闪避结束 */
-    if (data->action_timer >= 2 || data->stamina == 0)
-    {
-        data->action_timer = 0;
-        return CHAR_IDLE;
-    }
-
-    return CHAR_DODGING;
-}
-
-/**
- * @brief 濒死状态处理器
- */
-static fsm_state_t character_dying_handler(fsm_context_t *ctx)
-{
-    character_data_t *data = (character_data_t *)fsm_get_user_data(ctx);
-
-    if (data == NULL)
-    {
-        return CHAR_DYING;
-    }
-
-    printf("💀 角色濒死！等待复活...\n");
-    data->action_timer++;
-    data->is_alive = false;
-
-    /* 3秒后自动复活 */
-    if (data->action_timer >= 3)
-    {
-        data->action_timer = 0;
-        data->health = data->max_health;
-        data->stamina = data->max_stamina;
-        data->is_alive = true;
-        printf("✨ 角色复活！生命值: %u\n", data->health);
-        return CHAR_IDLE;
-    }
-
-    return CHAR_DYING;
+    log_push("ENTRY", state, ctx);
 }
 
 /*============================================================================
- * 条件函数
+ * 转换条件
  *============================================================================*/
-
-/**
- * @brief 检查是否存活
- */
-static bool is_alive(const fsm_context_t *ctx)
+static bool cond_run_ok(const fsm_context_t *ctx)
 {
-    const character_data_t *data = (const character_data_t *)fsm_get_user_data(ctx);
-    return (data != NULL && data->is_alive);
-}
-
-/**
- * @brief 检查是否有足够体力
- */
-static bool has_stamina(const fsm_context_t *ctx)
-{
-    const character_data_t *data = (const character_data_t *)fsm_get_user_data(ctx);
-    return (data != NULL && data->stamina > 10);
-}
-
-/**
- * @brief 检查是否在战斗中
- */
-static bool is_in_combat(const fsm_context_t *ctx)
-{
-    const character_data_t *data = (const character_data_t *)fsm_get_user_data(ctx);
-    return (data != NULL && data->in_combat);
-}
-
-/**
- * @brief 检查是否死亡
- */
-static bool is_dead(const fsm_context_t *ctx)
-{
-    const character_data_t *data = (const character_data_t *)fsm_get_user_data(ctx);
-    return (data != NULL && !data->is_alive);
+    const motor_ctx_t *m = (const motor_ctx_t *)fsm_get_user_data(ctx);
+    return m->run_requested && !m->fault_active;
 }
 
 /*============================================================================
- * 回调函数
+ * Handler（TOP 是复合虚节点，可以没有 handler；此处给一个空实现）
  *============================================================================*/
-
-#if FSM_ENABLE_CALLBACKS
-/**
- * @brief 状态进入回调
- */
-static void character_on_entry(fsm_context_t *ctx, fsm_state_t state)
+static fsm_state_t handler_top(fsm_context_t *ctx)
 {
-    character_data_t *data = (character_data_t *)fsm_get_user_data(ctx);
-
-    if (data == NULL)
-    {
-        return;
-    }
-
-    /* 重置计时器 */
-    data->action_timer = 0;
-
-    /* 进入状态时清理战斗状态 */
-    if (state == CHAR_IDLE || state == CHAR_WALKING || state == CHAR_RUNNING)
-    {
-        data->in_combat = false;
-    }
-
-    /* 根据进入的状态执行特定操作 */
-    switch (state)
-    {
-    case CHAR_ALIVE:
-        printf("=== 进入【存活】状态 ===\n");
-        break;
-    case CHAR_IDLE:
-        printf("=== 进入【站立】状态 ===\n");
-        break;
-    case CHAR_MOVING:
-        printf("=== 进入【移动】父状态 ===\n");
-        break;
-    case CHAR_WALKING:
-        printf("=== 进入【行走】状态 ===\n");
-        break;
-    case CHAR_RUNNING:
-        printf("=== 进入【奔跑】状态 ===\n");
-        break;
-    case CHAR_ATTACKING:
-        printf("=== 进入【攻击】父状态 ===\n");
-        break;
-    case CHAR_MELEE:
-        printf("=== 进入【近战攻击】状态 ===\n");
-        break;
-    case CHAR_RANGED:
-        printf("=== 进入【远程攻击】状态 ===\n");
-        break;
-    case CHAR_DEFENDING:
-        printf("=== 进入【防御】父状态 ===\n");
-        break;
-    case CHAR_BLOCKING:
-        printf("=== 进入【格挡】状态 ===\n");
-        break;
-    case CHAR_DODGING:
-        printf("=== 进入【闪避】状态 ===\n");
-        break;
-    case CHAR_DEAD:
-        printf("=== 进入【死亡】父状态 ===\n");
-        break;
-    case CHAR_DYING:
-        printf("=== 进入【濒死】状态 ===\n");
-        break;
-    default:
-        break;
-    }
+    return fsm_get_current_state(ctx); /* 虚根不主动跳转 */
 }
 
-/**
- * @brief 状态退出回调
- */
-static void character_on_exit(fsm_context_t *ctx, fsm_state_t state)
+static fsm_state_t handler_operational(fsm_context_t *ctx)
 {
-    (void)ctx;
+    /* 复合状态本身不应被直接驻留；正常情况下应处于子状态 */
+    return fsm_get_current_state(ctx);
+}
 
-    /* 根据退出的状态执行清理操作 */
-    switch (state)
+static fsm_state_t handler_idle(fsm_context_t *ctx)
+{
+    fsm_event_t ev = fsm_get_current_event(ctx);
+    motor_ctx_t *m = (motor_ctx_t *)fsm_get_user_data(ctx);
+
+    if (ev == EV_FAULT || m->fault_active)
     {
-    case CHAR_IDLE:
-        printf("=== 退出【站立】状态 ===\n");
-        break;
-    case CHAR_WALKING:
-        printf("=== 退出【行走】状态 ===\n");
-        break;
-    case CHAR_RUNNING:
-        printf("=== 退出【奔跑】状态 ===\n");
-        break;
-    case CHAR_MELEE:
-        printf("=== 退出【近战攻击】状态 ===\n");
-        break;
-    case CHAR_RANGED:
-        printf("=== 退出【远程攻击】状态 ===\n");
-        break;
-    case CHAR_BLOCKING:
-        printf("=== 退出【格挡】状态 ===\n");
-        break;
-    case CHAR_DODGING:
-        printf("=== 退出【闪避】状态 ===\n");
-        break;
-    case CHAR_DYING:
-        printf("=== 退出【濒死】状态 ===\n");
-        break;
-    default:
-        break;
+        return (fsm_state_t)ST_FAULT;
     }
+
+    if ((ev == EV_START) && m->run_requested && !m->fault_active)
+    {
+        return (fsm_state_t)ST_RUN;
+    }
+
+    return (fsm_state_t)ST_IDLE;
 }
-#endif
 
-/*============================================================================
- * Tick 源函数
- *============================================================================*/
-
-#if FSM_ENABLE_TIMEOUT
-/**
- * @brief 获取当前 tick 值
- */
-static uint32_t character_get_tick(void)
+static fsm_state_t handler_run(fsm_context_t *ctx)
 {
-    static uint32_t tick = 0;
-    return tick++;
+    fsm_event_t  ev = fsm_get_current_event(ctx);
+    motor_ctx_t *m  = (motor_ctx_t *)fsm_get_user_data(ctx);
+
+    m->run_cycles++;
+
+    if (ev == EV_FAULT || m->fault_active)
+    {
+        return (fsm_state_t)ST_FAULT;
+    }
+
+    if (ev == EV_STOP)
+    {
+        m->run_requested = false;
+        return (fsm_state_t)ST_IDLE;
+    }
+
+    return (fsm_state_t)ST_RUN;
 }
-#endif
+
+static fsm_state_t handler_fault(fsm_context_t *ctx)
+{
+    fsm_event_t  ev = fsm_get_current_event(ctx);
+    motor_ctx_t *m  = (motor_ctx_t *)fsm_get_user_data(ctx);
+
+    if (ev == EV_CLEAR)
+    {
+        m->fault_active = false;
+        return (fsm_state_t)ST_OPERATIONAL;
+    }
+
+    return (fsm_state_t)ST_FAULT;
+}
 
 /*============================================================================
- * 状态名称表 (用于调试)
+ * 测试辅助：构建标准电机状态机
  *============================================================================*/
+static fsm_context_t g_fsm;
 
-#if FSM_ENABLE_DEBUG
-static const char *character_state_names[] = {
-    "存活",      /* CHAR_ALIVE */
-    "站立",      /* CHAR_IDLE */
-    "移动(父)",  /* CHAR_MOVING */
-    "行走",      /* CHAR_WALKING */
-    "奔跑",      /* CHAR_RUNNING */
-    "攻击(父)",  /* CHAR_ATTACKING */
-    "近战",      /* CHAR_MELEE */
-    "远程",      /* CHAR_RANGED */
-    "防御(父)",  /* CHAR_DEFENDING */
-    "格挡",      /* CHAR_BLOCKING */
-    "闪避",      /* CHAR_DODGING */
-    "死亡(父)",  /* CHAR_DEAD */
-    "濒死",      /* CHAR_DYING */
-    NULL         /* 结束标记 */
-};
-#endif
+static void setup_motor_fsm(void)
+{
+    fsm_ret_t r;
+
+    memset(&g_motor, 0, sizeof(g_motor));
+    g_tick = 0U;
+    log_reset();
+
+    r = fsm_init(&g_fsm, (fsm_state_t)ST_IDLE, &g_motor);
+    TEST_ASSERT(r == FSM_OK);
+
+    /* 状态名称 */
+    r = fsm_set_state_names(&g_fsm, STATE_NAMES, (uint8_t)ST_COUNT);
+    TEST_ASSERT(r == FSM_OK);
+
+    /* Tick 源 */
+    r = fsm_set_tick_fn(&g_fsm, mock_tick);
+    TEST_ASSERT(r == FSM_OK);
+
+    /* 回调 */
+    r = fsm_set_callbacks(&g_fsm, on_entry_cb, on_exit_cb);
+    TEST_ASSERT(r == FSM_OK);
+
+    /* Handler 注册 */
+    TEST_ASSERT(fsm_register_handler(&g_fsm, ST_TOP,         handler_top)         == FSM_OK);
+    TEST_ASSERT(fsm_register_handler(&g_fsm, ST_OPERATIONAL, handler_operational) == FSM_OK);
+    TEST_ASSERT(fsm_register_handler(&g_fsm, ST_IDLE,        handler_idle)        == FSM_OK);
+    TEST_ASSERT(fsm_register_handler(&g_fsm, ST_RUN,         handler_run)         == FSM_OK);
+    TEST_ASSERT(fsm_register_handler(&g_fsm, ST_FAULT,       handler_fault)       == FSM_OK);
+
+    /* Transition 注册
+     *
+     * TOP 层（被 IDLE/RUN 通过父链继承）：
+     *   TOP → FAULT：无条件，任何子状态遇到 fault 都能跳过来
+     *
+     * IDLE 层：
+     *   IDLE → RUN：有条件（cond_run_ok）
+     *
+     * RUN 层：
+     *   RUN → IDLE：无条件
+     *
+     * FAULT 层：
+     *   FAULT → OPERATIONAL：无条件（恢复）
+     */
+    TEST_ASSERT(fsm_add_transition(&g_fsm, ST_TOP,   ST_FAULT,       NULL)       == FSM_OK);
+    TEST_ASSERT(fsm_add_transition(&g_fsm, ST_IDLE,  ST_RUN,         cond_run_ok) == FSM_OK);
+    TEST_ASSERT(fsm_add_transition(&g_fsm, ST_RUN,   ST_IDLE,        NULL)       == FSM_OK);
+    TEST_ASSERT(fsm_add_transition(&g_fsm, ST_FAULT, ST_OPERATIONAL, NULL)       == FSM_OK);
+
+    /* HSM 层级：parent_state 配置
+     *
+     *   TOP         → FSM_HSM_NO_PARENT（根）
+     *   OPERATIONAL → TOP
+     *   IDLE        → OPERATIONAL
+     *   RUN         → OPERATIONAL
+     *   FAULT       → TOP
+     */
+    TEST_ASSERT(fsm_hsm_set_parent(&g_fsm, ST_TOP,         FSM_HSM_NO_PARENT)       == FSM_OK);
+    TEST_ASSERT(fsm_hsm_set_parent(&g_fsm, ST_OPERATIONAL, (fsm_state_t)ST_TOP)     == FSM_OK);
+    TEST_ASSERT(fsm_hsm_set_parent(&g_fsm, ST_IDLE,        (fsm_state_t)ST_OPERATIONAL) == FSM_OK);
+    TEST_ASSERT(fsm_hsm_set_parent(&g_fsm, ST_RUN,         (fsm_state_t)ST_OPERATIONAL) == FSM_OK);
+    TEST_ASSERT(fsm_hsm_set_parent(&g_fsm, ST_FAULT,       (fsm_state_t)ST_TOP)     == FSM_OK);
+
+    /* 超时：FAULT 超过 500 tick 自动恢复 */
+    TEST_ASSERT(fsm_add_timeout(&g_fsm, ST_FAULT, 500U, (fsm_state_t)ST_OPERATIONAL) == FSM_OK);
+}
 
 /*============================================================================
- * 游戏角色状态机初始化函数 (HSM 版本)
+ * T01：层级深度与祖先关系
  *============================================================================*/
+static void test_t01_hierarchy_meta(void)
+{
+    setup_motor_fsm();
 
-/**
- * @brief 初始化游戏角色状态机
+    /* 深度 */
+    TEST_ASSERT(fsm_hsm_get_depth(&g_fsm, ST_TOP)         == 0U);
+    TEST_ASSERT(fsm_hsm_get_depth(&g_fsm, ST_OPERATIONAL) == 1U);
+    TEST_ASSERT(fsm_hsm_get_depth(&g_fsm, ST_IDLE)        == 2U);
+    TEST_ASSERT(fsm_hsm_get_depth(&g_fsm, ST_RUN)         == 2U);
+    TEST_ASSERT(fsm_hsm_get_depth(&g_fsm, ST_FAULT)       == 1U);
+
+    /* 祖先关系 */
+    TEST_ASSERT(fsm_hsm_is_ancestor(&g_fsm, ST_TOP,         ST_IDLE)        == true);
+    TEST_ASSERT(fsm_hsm_is_ancestor(&g_fsm, ST_OPERATIONAL, ST_IDLE)        == true);
+    TEST_ASSERT(fsm_hsm_is_ancestor(&g_fsm, ST_OPERATIONAL, ST_RUN)         == true);
+    TEST_ASSERT(fsm_hsm_is_ancestor(&g_fsm, ST_TOP,         ST_FAULT)       == true);
+    TEST_ASSERT(fsm_hsm_is_ancestor(&g_fsm, ST_OPERATIONAL, ST_FAULT)       == false); /* FAULT 在 TOP 下 */
+    TEST_ASSERT(fsm_hsm_is_ancestor(&g_fsm, ST_IDLE,        ST_RUN)         == false); /* 兄弟 */
+    TEST_ASSERT(fsm_hsm_is_ancestor(&g_fsm, ST_IDLE,        ST_IDLE)        == true);  /* 自身 */
+
+    printf("[T01] PASS: 层级深度与祖先关系\n");
+}
+
+/*============================================================================
+ * T02：LCA 计算
+ *============================================================================*/
+static void test_t02_lca(void)
+{
+    setup_motor_fsm();
+
+    /* IDLE ↔ RUN：兄弟，LCA = OPERATIONAL */
+    TEST_ASSERT(fsm_hsm_get_lca(&g_fsm, ST_IDLE, ST_RUN)         == (fsm_state_t)ST_OPERATIONAL);
+
+    /* IDLE ↔ FAULT：IDLE 在 OPERATIONAL 下，FAULT 在 TOP 下，LCA = TOP */
+    TEST_ASSERT(fsm_hsm_get_lca(&g_fsm, ST_IDLE, ST_FAULT)       == (fsm_state_t)ST_TOP);
+
+    /* RUN ↔ FAULT：同上 */
+    TEST_ASSERT(fsm_hsm_get_lca(&g_fsm, ST_RUN, ST_FAULT)        == (fsm_state_t)ST_TOP);
+
+    /* OPERATIONAL ↔ FAULT：均在 TOP 下，LCA = TOP */
+    TEST_ASSERT(fsm_hsm_get_lca(&g_fsm, ST_OPERATIONAL, ST_FAULT) == (fsm_state_t)ST_TOP);
+
+    /* 自身 ↔ 自身 = 自身 */
+    TEST_ASSERT(fsm_hsm_get_lca(&g_fsm, ST_IDLE, ST_IDLE)        == (fsm_state_t)ST_IDLE);
+
+    /* 祖先 ↔ 子孙：LCA = 祖先 */
+    TEST_ASSERT(fsm_hsm_get_lca(&g_fsm, ST_TOP, ST_IDLE)         == (fsm_state_t)ST_TOP);
+    TEST_ASSERT(fsm_hsm_get_lca(&g_fsm, ST_OPERATIONAL, ST_RUN)  == (fsm_state_t)ST_OPERATIONAL);
+
+    printf("[T02] PASS: LCA 计算\n");
+}
+
+/*============================================================================
+ * T03：转换继承（IDLE 继承 TOP 的 → FAULT）
  *
- * HSM 层次结构设置：
- * - CHAR_ALIVE 是 CHAR_IDLE, CHAR_MOVING, CHAR_ATTACKING, CHAR_DEFENDING 的父状态
- * - CHAR_MOVING 是 CHAR_WALKING, CHAR_RUNNING 的父状态
- * - CHAR_ATTACKING 是 CHAR_MELEE, CHAR_RANGED 的父状态
- * - CHAR_DEFENDING 是 CHAR_BLOCKING, CHAR_DODGING 的父状态
- * - CHAR_DEAD 是 CHAR_DYING 的父状态
- */
-static fsm_ret_t character_init_hsm(fsm_context_t *ctx, character_data_t *data)
+ *   IDLE 自身 transitions 行没有 → FAULT 的条目。
+ *   通过父链：IDLE → OPERATIONAL（没有）→ TOP（有，无条件）→ 允许。
+ *============================================================================*/
+static void test_t03_transition_inheritance(void)
 {
-    fsm_ret_t ret;
+    setup_motor_fsm();
 
-    if (ctx == NULL || data == NULL)
-    {
-        return FSM_ERROR_NULL_PTR;
-    }
+    /* 在 IDLE 状态时，handler 返回 ST_FAULT（由故障触发） */
+    /* fsm_step 的第一次调用先处理 state_changed（消费初始进入），不做转换 */
+    fsm_step(&g_fsm); /* 消费初始 state_changed */
 
-    /* 初始化状态机上下文 */
-    ret = fsm_init(ctx, CHAR_IDLE, data);
-    if (ret != FSM_OK)
-    {
-        return ret;
-    }
+    g_motor.fault_active = true;
+    fsm_post_event(&g_fsm, EV_FAULT);
+    fsm_ret_t r = fsm_step(&g_fsm);
 
-    /* 注册状态处理器 */
-    fsm_register_handler(ctx, CHAR_IDLE, character_idle_handler);
-    fsm_register_handler(ctx, CHAR_WALKING, character_walking_handler);
-    fsm_register_handler(ctx, CHAR_RUNNING, character_running_handler);
-    fsm_register_handler(ctx, CHAR_MELEE, character_melee_handler);
-    fsm_register_handler(ctx, CHAR_RANGED, character_ranged_handler);
-    fsm_register_handler(ctx, CHAR_BLOCKING, character_blocking_handler);
-    fsm_register_handler(ctx, CHAR_DODGING, character_dodging_handler);
-    fsm_register_handler(ctx, CHAR_DYING, character_dying_handler);
+    TEST_ASSERT(r == FSM_OK);
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_FAULT);
 
-    /* ========== 设置 HSM 层次结构 ========== */
-    /* 注意：必须先设置父关系，再添加转换 */
-
-    /* 存活分支的父状态设置 */
-    ret = fsm_hsm_set_parent(ctx, CHAR_IDLE, CHAR_ALIVE);
-    if (ret != FSM_OK) return ret;
-
-    ret = fsm_hsm_set_parent(ctx, CHAR_MOVING, CHAR_ALIVE);
-    if (ret != FSM_OK) return ret;
-
-    ret = fsm_hsm_set_parent(ctx, CHAR_ATTACKING, CHAR_ALIVE);
-    if (ret != FSM_OK) return ret;
-
-    ret = fsm_hsm_set_parent(ctx, CHAR_DEFENDING, CHAR_ALIVE);
-    if (ret != FSM_OK) return ret;
-
-    /* 移动子状态的父状态 */
-    ret = fsm_hsm_set_parent(ctx, CHAR_WALKING, CHAR_MOVING);
-    if (ret != FSM_OK) return ret;
-
-    ret = fsm_hsm_set_parent(ctx, CHAR_RUNNING, CHAR_MOVING);
-    if (ret != FSM_OK) return ret;
-
-    /* 攻击子状态的父状态 */
-    ret = fsm_hsm_set_parent(ctx, CHAR_MELEE, CHAR_ATTACKING);
-    if (ret != FSM_OK) return ret;
-
-    ret = fsm_hsm_set_parent(ctx, CHAR_RANGED, CHAR_ATTACKING);
-    if (ret != FSM_OK) return ret;
-
-    /* 防御子状态的父状态 */
-    ret = fsm_hsm_set_parent(ctx, CHAR_BLOCKING, CHAR_DEFENDING);
-    if (ret != FSM_OK) return ret;
-
-    ret = fsm_hsm_set_parent(ctx, CHAR_DODGING, CHAR_DEFENDING);
-    if (ret != FSM_OK) return ret;
-
-    /* 死亡分支的父状态设置 */
-    ret = fsm_hsm_set_parent(ctx, CHAR_DYING, CHAR_DEAD);
-    if (ret != FSM_OK) return ret;
-
-    /* 设置根状态 (ALIVE 和 DEAD 是顶级父状态) */
-    ret = fsm_hsm_set_parent(ctx, CHAR_ALIVE, FSM_HSM_NO_PARENT);
-    if (ret != FSM_OK) return ret;
-
-    ret = fsm_hsm_set_parent(ctx, CHAR_DEAD, FSM_HSM_NO_PARENT);
-    if (ret != FSM_OK) return ret;
-
-    /* ========== 添加状态转换 (利用 HSM 转换继承) ========== */
-
-    /* --- 存活分支的转换 --- */
-
-    /* 站立状态的转换 (直接到子状态) */
-    fsm_add_transition(ctx, CHAR_IDLE, CHAR_WALKING, has_stamina);  /* 有体力时开始行走 */
-    fsm_add_transition(ctx, CHAR_IDLE, CHAR_MELEE, FSM_COND_ALWAYS); /* 站立时可以近战 */
-    fsm_add_transition(ctx, CHAR_IDLE, CHAR_RANGED, FSM_COND_ALWAYS); /* 站立时可以远程 */
-    fsm_add_transition(ctx, CHAR_IDLE, CHAR_BLOCKING, FSM_COND_ALWAYS); /* 站立时可以格挡 */
-    fsm_add_transition(ctx, CHAR_IDLE, CHAR_DODGING, FSM_COND_ALWAYS); /* 站立时可以闪避 */
-    fsm_add_transition(ctx, CHAR_IDLE, CHAR_DYING, is_dead); /* 死亡时进入濒死状态 */
-
-    /* 移动父状态的转换 (子状态会继承) */
-    fsm_add_transition(ctx, CHAR_MOVING, CHAR_IDLE, FSM_COND_ALWAYS); /* 停止移动 */
-    fsm_add_transition(ctx, CHAR_MOVING, CHAR_MELEE, FSM_COND_ALWAYS); /* 移动中也可以攻击 */
-    fsm_add_transition(ctx, CHAR_MOVING, CHAR_RANGED, FSM_COND_ALWAYS); /* 移动中也可以远程 */
-    fsm_add_transition(ctx, CHAR_MOVING, CHAR_BLOCKING, FSM_COND_ALWAYS); /* 移动中可以格挡 */
-    fsm_add_transition(ctx, CHAR_MOVING, CHAR_DYING, is_dead); /* 死亡时进入濒死状态 */
-
-    /* 攻击父状态的转换 (子状态会继承) */
-    fsm_add_transition(ctx, CHAR_ATTACKING, CHAR_IDLE, FSM_COND_ALWAYS); /* 攻击完成后返回站立 */
-    fsm_add_transition(ctx, CHAR_ATTACKING, CHAR_DYING, is_dead); /* 死亡时进入濒死状态 */
-
-    /* 防御父状态的转换 (子状态会继承) */
-    fsm_add_transition(ctx, CHAR_DEFENDING, CHAR_IDLE, FSM_COND_ALWAYS); /* 防御结束 */
-    fsm_add_transition(ctx, CHAR_DEFENDING, CHAR_DYING, is_dead); /* 死亡时进入濒死状态 */
-
-    /* --- 死亡分支的转换 --- */
-    fsm_add_transition(ctx, CHAR_DYING, CHAR_IDLE, is_alive); /* 复活时返回站立状态 */
-
-#if FSM_ENABLE_CALLBACKS
-    /* 注册回调函数 */
-    fsm_set_callbacks(ctx, character_on_entry, character_on_exit);
-#endif
-
-#if FSM_ENABLE_DEBUG
-    /* 设置状态名称表 */
-    fsm_set_state_names(ctx, character_state_names, CHAR_STATE_COUNT);
-#endif
-
-#if FSM_ENABLE_TIMEOUT
-    /* 设置 tick 源 */
-    fsm_set_tick_fn(ctx, character_get_tick);
-#endif
-
-    return FSM_OK;
+    printf("[T03] PASS: 转换继承（IDLE 通过父链继承 TOP → FAULT）\n");
 }
 
 /*============================================================================
- * 主函数 - 演示游戏角色 HSM 状态机运行
+ * T04 & T05：退出链（bottom-up）和进入链（top-down）顺序验证
+ *
+ *   IDLE → FAULT，LCA = TOP
+ *
+ *   期望退出顺序：EXIT(IDLE)、EXIT(OPERATIONAL)       （不含 TOP = LCA）
+ *   期望进入顺序：ENTRY(FAULT)                         （不含 TOP = LCA）
  *============================================================================*/
+static void test_t04_t05_exit_entry_order(void)
+{
+    setup_motor_fsm();
+    log_reset();
 
+    fsm_step(&g_fsm); /* 消费初始 state_changed（ENTRY(IDLE) 在此触发）*/
+    log_reset();      /* 清掉初始进入的日志，只关心后续转换 */
+
+    /* 触发 IDLE → FAULT */
+    g_motor.fault_active = true;
+    fsm_post_event(&g_fsm, EV_FAULT);
+    fsm_step(&g_fsm);
+
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_FAULT);
+
+    /* 验证日志顺序 */
+    TEST_ASSERT(g_log_count == 3);
+    TEST_ASSERT(strcmp(g_log[0], "EXIT(IDLE)")        == 0);
+    TEST_ASSERT(strcmp(g_log[1], "EXIT(OPERATIONAL)") == 0);
+    TEST_ASSERT(strcmp(g_log[2], "ENTRY(FAULT)")      == 0);
+
+    printf("[T04] PASS: 退出链 bottom-up（IDLE → OPERATIONAL，不含 TOP）\n");
+    printf("[T05] PASS: 进入链 top-down（FAULT，不含 TOP）\n");
+}
+
+/*============================================================================
+ * T06：LCA = OPERATIONAL 时（IDLE ↔ RUN）只触发直接状态的 exit/entry
+ *
+ *   期望退出：EXIT(IDLE)                 （OPERATIONAL = LCA，不触发）
+ *   期望进入：ENTRY(RUN)
+ *============================================================================*/
+static void test_t06_lca_operational(void)
+{
+    setup_motor_fsm();
+    fsm_step(&g_fsm); /* 消费初始 state_changed */
+    log_reset();
+
+    /* 触发 IDLE → RUN */
+    g_motor.run_requested = true;
+    fsm_post_event(&g_fsm, EV_START);
+    fsm_step(&g_fsm);
+
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_RUN);
+    TEST_ASSERT(g_log_count == 2);
+    TEST_ASSERT(strcmp(g_log[0], "EXIT(IDLE)")  == 0);
+    TEST_ASSERT(strcmp(g_log[1], "ENTRY(RUN)")  == 0);
+
+    printf("[T06] PASS: LCA=OPERATIONAL，仅触发直接 exit(IDLE)/entry(RUN)\n");
+}
+
+/*============================================================================
+ * T07：转换继承优先级——子状态条件 false 时阻止向父继承
+ *
+ *   IDLE 有 → RUN 的条目（cond_run_ok），但条件返回 false（fault_active=true）。
+ *   期望：转换被拒绝（不会向父继承并错误地允许）。
+ *============================================================================*/
+static void test_t07_inheritance_guard(void)
+{
+    setup_motor_fsm();
+    fsm_step(&g_fsm);
+
+    /* 有故障时，cond_run_ok 返回 false，转换应被拒绝 */
+    g_motor.fault_active  = true;
+    g_motor.run_requested = true;
+    /* 不投递 EV_FAULT，让 handler 直接返回 ST_RUN（手动触发）*/
+    /* 用 fsm_request_transition 测试 validator */
+    fsm_ret_t r = fsm_request_transition(&g_fsm, (fsm_state_t)ST_RUN);
+    TEST_ASSERT(r == FSM_ERROR_INVALID_TRANSITION);
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_IDLE);
+
+    printf("[T07] PASS: 子状态条件 false 时阻止向父继承\n");
+}
+
+/*============================================================================
+ * T08：fsm_request_transition() 在 HSM 模式下的退出/进入链
+ *
+ *   从 IDLE 外部请求跳转到 FAULT，验证 exit/entry 顺序。
+ *============================================================================*/
+static void test_t08_request_transition_hsm(void)
+{
+    setup_motor_fsm();
+    fsm_step(&g_fsm);
+    log_reset();
+
+    /* 外部直接请求（IDLE → FAULT，TOP 层 transition 已注册无条件） */
+    fsm_ret_t r = fsm_request_transition(&g_fsm, (fsm_state_t)ST_FAULT);
+    TEST_ASSERT(r == FSM_OK);
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_FAULT);
+
+    TEST_ASSERT(g_log_count == 3);
+    TEST_ASSERT(strcmp(g_log[0], "EXIT(IDLE)")        == 0);
+    TEST_ASSERT(strcmp(g_log[1], "EXIT(OPERATIONAL)") == 0);
+    TEST_ASSERT(strcmp(g_log[2], "ENTRY(FAULT)")      == 0);
+
+    printf("[T08] PASS: fsm_request_transition() 触发正确的 HSM exit/entry 链\n");
+}
+
+/*============================================================================
+ * T09：超时 + HSM（FAULT → OPERATIONAL）
+ *
+ *   FAULT 超时后跳回 OPERATIONAL（通过 fsm_hsm_check_timeout 执行 HSM 转换）。
+ *   期望进入链：ENTRY(OPERATIONAL)（LCA=TOP 不触发，FAULT → TOP → OPERATIONAL）
+ *============================================================================*/
+static void test_t09_timeout_hsm(void)
+{
+    setup_motor_fsm();
+    fsm_step(&g_fsm);
+
+    /* 先进入 FAULT */
+    g_motor.fault_active = true;
+    fsm_request_transition(&g_fsm, (fsm_state_t)ST_FAULT);
+    fsm_step(&g_fsm); /* 消费 state_changed，记录 enter_tick */
+    log_reset();
+
+    /* 时间未到，不超时 */
+    g_tick = 499U;
+    fsm_ret_t r = fsm_step(&g_fsm);
+    TEST_ASSERT(r == FSM_OK);
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_FAULT);
+
+    /* 超时触发 */
+    g_tick = 501U;
+    r = fsm_step(&g_fsm);
+    TEST_ASSERT(r == FSM_ERROR_TIMEOUT);
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_OPERATIONAL);
+
+    /* 验证 exit/entry 链：FAULT → OPERATIONAL，LCA=TOP */
+    TEST_ASSERT(g_log_count == 2);
+    TEST_ASSERT(strcmp(g_log[0], "EXIT(FAULT)")          == 0);
+    TEST_ASSERT(strcmp(g_log[1], "ENTRY(OPERATIONAL)")   == 0);
+
+    printf("[T09] PASS: 超时 + HSM exit/entry 链（FAULT → OPERATIONAL）\n");
+}
+
+/*============================================================================
+ * T10：fsm_reset() 保留 parent 配置
+ *============================================================================*/
+static void test_t10_reset_keeps_parent(void)
+{
+    setup_motor_fsm();
+
+    /* 验证初始 parent 配置 */
+    TEST_ASSERT(g_fsm.hsm_parent[ST_IDLE]        == (fsm_state_t)ST_OPERATIONAL);
+    TEST_ASSERT(g_fsm.hsm_parent[ST_OPERATIONAL] == (fsm_state_t)ST_TOP);
+
+    /* 执行一些转换后 reset */
+    fsm_step(&g_fsm);
+    g_motor.run_requested = true;
+    fsm_post_event(&g_fsm, EV_START);
+    fsm_step(&g_fsm); /* IDLE → RUN */
+
+    fsm_reset(&g_fsm, (fsm_state_t)ST_IDLE);
+
+    /* parent 配置应保留 */
+    TEST_ASSERT(g_fsm.hsm_parent[ST_IDLE]        == (fsm_state_t)ST_OPERATIONAL);
+    TEST_ASSERT(g_fsm.hsm_parent[ST_OPERATIONAL] == (fsm_state_t)ST_TOP);
+
+    /* 状态应回到 IDLE */
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_IDLE);
+
+    /* 转换继承仍然有效 */
+    g_motor.fault_active = true;
+    fsm_step(&g_fsm); /* 消费初始 */
+    fsm_post_event(&g_fsm, EV_FAULT);
+    fsm_step(&g_fsm);
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_FAULT);
+
+    printf("[T10] PASS: fsm_reset() 保留 parent 配置，转换继承仍有效\n");
+}
+
+/*============================================================================
+ * T11：循环父链检测
+ *============================================================================*/
+static void test_t11_cycle_detection(void)
+{
+    fsm_context_t ctx;
+    fsm_init(&ctx, 0U, NULL);
+
+    /* 正常设置：0 → 1 → 2 */
+    TEST_ASSERT(fsm_hsm_set_parent(&ctx, 1U, 0U) == FSM_OK);
+    TEST_ASSERT(fsm_hsm_set_parent(&ctx, 2U, 1U) == FSM_OK);
+
+    /* 自指：state == parent */
+    TEST_ASSERT(fsm_hsm_set_parent(&ctx, 0U, 0U) == FSM_ERROR);
+
+    /* 逆向成环：0 → 2（会导致 0 → 1 → 2 → 0 的环）*/
+    TEST_ASSERT(fsm_hsm_set_parent(&ctx, 0U, 2U) == FSM_ERROR);
+
+    printf("[T11] PASS: 循环父链检测（自指 + 逆向成环）\n");
+}
+
+/*============================================================================
+ * T12：v2.0 特性在 HSM 模式下仍正常工作（stats、trace、event queue）
+ *============================================================================*/
+static void test_t12_v20_features_with_hsm(void)
+{
+    fsm_state_stats_t stats;
+    fsm_trace_entry_t trace[FSM_TRACE_BUFFER_SIZE];
+    uint8_t           trace_count = 0U;
+
+    setup_motor_fsm();
+
+    /* 执行若干转换：IDLE → RUN → IDLE → FAULT */
+    fsm_step(&g_fsm);
+
+    g_motor.run_requested = true;
+    fsm_post_event(&g_fsm, EV_START);
+    fsm_step(&g_fsm); /* IDLE → RUN */
+    fsm_step(&g_fsm); /* 消费 state_changed */
+
+    fsm_post_event(&g_fsm, EV_STOP);
+    fsm_step(&g_fsm); /* RUN → IDLE */
+    fsm_step(&g_fsm);
+
+    g_motor.fault_active = true;
+    fsm_post_event(&g_fsm, EV_FAULT);
+    fsm_step(&g_fsm); /* IDLE → FAULT */
+
+    /* ---- stats ---- */
+    TEST_ASSERT(fsm_get_stats(&g_fsm, ST_IDLE, &stats) == FSM_OK);
+    TEST_ASSERT(stats.enter_count >= 1U);
+
+    TEST_ASSERT(fsm_get_stats(&g_fsm, ST_RUN, &stats) == FSM_OK);
+    TEST_ASSERT(stats.enter_count == 1U);
+
+    /* ---- trace ---- */
+    TEST_ASSERT(fsm_get_trace(&g_fsm, trace, FSM_TRACE_BUFFER_SIZE, &trace_count) == FSM_OK);
+    TEST_ASSERT(trace_count >= 3U); /* 至少 3 条转换：→RUN, →IDLE, →FAULT */
+
+    /* 最后一条转换应该是 → FAULT */
+    TEST_ASSERT(trace[trace_count - 1U].to_state == (fsm_state_t)ST_FAULT);
+
+    printf("[T12] PASS: v2.0 stats/trace 在 HSM 模式下正常（stats.enter_count=%u，trace=%u 条）\n",
+           (unsigned)stats.enter_count, (unsigned)trace_count);
+}
+
+/*============================================================================
+ * T13：完整场景演练（带日志输出，辅助人工核查）
+ *
+ *   依次执行：
+ *   IDLE -[start]→ RUN -[stop]→ IDLE -[fault]→ FAULT -[clear]→ OPERATIONAL
+ *============================================================================*/
+static void test_t13_full_scenario(void)
+{
+    setup_motor_fsm();
+    fsm_step(&g_fsm); /* 消费初始进入 */
+
+    printf("\n--- T13 场景日志 ---\n");
+    printf("初始状态: %s\n\n", fsm_get_state_name(&g_fsm, fsm_get_current_state(&g_fsm)));
+
+    /* Step 1: IDLE → RUN */
+    log_reset();
+    g_motor.run_requested = true;
+    fsm_post_event(&g_fsm, EV_START);
+    fsm_step(&g_fsm);
+    printf("事件 EV_START → 状态: %s\n", fsm_get_state_name(&g_fsm, fsm_get_current_state(&g_fsm)));
+    for (int k = 0; k < g_log_count; k++) { printf("  %s\n", g_log[k]); }
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_RUN);
+    fsm_step(&g_fsm);
+
+    /* Step 2: RUN → IDLE */
+    log_reset();
+    fsm_post_event(&g_fsm, EV_STOP);
+    fsm_step(&g_fsm);
+    printf("\n事件 EV_STOP → 状态: %s\n", fsm_get_state_name(&g_fsm, fsm_get_current_state(&g_fsm)));
+    for (int k = 0; k < g_log_count; k++) { printf("  %s\n", g_log[k]); }
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_IDLE);
+    fsm_step(&g_fsm);
+
+    /* Step 3: IDLE → FAULT（通过继承 TOP 的 transition）*/
+    log_reset();
+    g_motor.fault_active = true;
+    fsm_post_event(&g_fsm, EV_FAULT);
+    fsm_step(&g_fsm);
+    printf("\n事件 EV_FAULT → 状态: %s\n", fsm_get_state_name(&g_fsm, fsm_get_current_state(&g_fsm)));
+    for (int k = 0; k < g_log_count; k++) { printf("  %s\n", g_log[k]); }
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_FAULT);
+    fsm_step(&g_fsm);
+
+    /* Step 4: FAULT → OPERATIONAL（clear）*/
+    log_reset();
+    fsm_post_event(&g_fsm, EV_CLEAR);
+    fsm_step(&g_fsm);
+    printf("\n事件 EV_CLEAR → 状态: %s\n", fsm_get_state_name(&g_fsm, fsm_get_current_state(&g_fsm)));
+    for (int k = 0; k < g_log_count; k++) { printf("  %s\n", g_log[k]); }
+    TEST_ASSERT(fsm_get_current_state(&g_fsm) == (fsm_state_t)ST_OPERATIONAL);
+
+    printf("--- 场景演练完成 ---\n\n");
+    printf("[T13] PASS: 完整场景演练\n");
+}
+
+/*============================================================================
+ * main
+ *============================================================================*/
 int main(void)
 {
-    fsm_context_t character_fsm;
-    character_data_t character_data = {
-        .health = 100,
-        .max_health = 100,
-        .stamina = 100,
-        .max_stamina = 100,
-        .action_timer = 0,
-        .damage = 25,
-        .is_alive = true,
-        .in_combat = false
-    };
+    printf("=== FSM v2.1 HSM 层次化状态机验证 ===\n\n");
+    printf("编译配置：FSM_ENABLE_HSM=%d, FSM_MAX_STATES=%u\n",
+           FSM_ENABLE_HSM, (unsigned)FSM_MAX_STATES);
+    printf("sizeof(fsm_context_t) = %u bytes\n\n",
+           (unsigned)sizeof(fsm_context_t));
 
-    fsm_ret_t ret;
-    int tick_count = 0;
+    test_t01_hierarchy_meta();
+    test_t02_lca();
+    test_t03_transition_inheritance();
+    test_t04_t05_exit_entry_order();
+    test_t06_lca_operational();
+    test_t07_inheritance_guard();
+    test_t08_request_transition_hsm();
+    test_t09_timeout_hsm();
+    test_t10_reset_keeps_parent();
+    test_t11_cycle_detection();
+    test_t12_v20_features_with_hsm();
+    test_t13_full_scenario();
 
-    printf("🎮 游戏角色 HSM 状态机演示开始\n\n");
-
-    /* 初始化 HSM 状态机 */
-    ret = character_init_hsm(&character_fsm, &character_data);
-    if (ret != FSM_OK)
-    {
-        printf("错误: 状态机初始化失败 (错误码: %d)\n", ret);
-        return -1;
-    }
-
-    printf("角色初始化完成，进入HSM层次结构...\n\n");
-
-    /* 运行角色状态机 */
-    while (tick_count < 35)
-    {
-        /* 执行状态机步进 */
-        ret = fsm_step(&character_fsm);
-        if (ret != FSM_OK && ret != FSM_ERROR_TIMEOUT)
-        {
-            printf("错误: 状态机步进失败 (错误码: %d)\n", ret);
-            break;
-        }
-
-        /* 模拟外部事件 */
-        switch (tick_count)
-        {
-        case 3:
-            printf("\n🏃 触发行走事件\n");
-            fsm_post_event(&character_fsm, CHAR_EVENT_WALK);
-            break;
-
-        case 6:
-            printf("\n🏃 触发奔跑事件\n");
-            fsm_post_event(&character_fsm, CHAR_EVENT_RUN);
-            break;
-
-        case 9:
-            printf("\n🛡️ 触发受伤事件!\n");
-            fsm_post_event(&character_fsm, CHAR_EVENT_TAKE_DAMAGE);
-            break;
-
-        case 12:
-            printf("\n⚔️ 触发近战攻击事件\n");
-            fsm_post_event(&character_fsm, CHAR_EVENT_ATTACK_MELEE);
-            break;
-
-        case 16:
-            printf("\n🏹 触发远程攻击事件\n");
-            fsm_post_event(&character_fsm, CHAR_EVENT_ATTACK_RANGED);
-            break;
-
-        case 20:
-            printf("\n🛡️ 触发格挡事件\n");
-            fsm_post_event(&character_fsm, CHAR_EVENT_BLOCK);
-            break;
-
-        case 23:
-            printf("\n💨 触发闪避事件\n");
-            fsm_post_event(&character_fsm, CHAR_EVENT_DODGE);
-            break;
-
-        case 26:
-            printf("\n💀 模拟死亡 (设置 is_alive = false)\n");
-            character_data.is_alive = false;
-            character_data.health = 0;
-            fsm_post_event(&character_fsm, CHAR_EVENT_DIE);
-            break;
-        }
-
-        /* 显示当前状态信息 */
-#if FSM_ENABLE_DEBUG
-        const char *state_name = fsm_get_state_name(&character_fsm,
-                                                    fsm_get_current_state(&character_fsm));
-        printf("当前状态: %s\n", state_name ? state_name : "未知");
-#endif
-
-        /* 显示角色信息 */
-        printf("生命: %u/%u | 体力: %u/%u | 战斗: %s\n",
-               character_data.health, character_data.max_health,
-               character_data.stamina, character_data.max_stamina,
-               character_data.in_combat ? "是" : "否");
-        printf("---\n");
-
-        /* 等待 1 秒 */
-        sleep(1);
-        tick_count++;
-    }
-
-    printf("\n🎮 游戏角色 HSM 状态机演示结束\n");
-
-    /* 显示统计信息 */
-#if FSM_ENABLE_STATS
-    printf("\n=== 状态统计信息 ===\n");
-    for (fsm_state_t state = 0; state < CHAR_STATE_COUNT; state++)
-    {
-        const char *state_name = fsm_get_state_name(&character_fsm, state);
-        if (state_name != NULL)
-        {
-            printf("%s: 状态ID = %d\n", state_name, state);
-        }
-    }
-#endif
-
+    printf("\n所有测试通过 (13/13)\n");
     return 0;
 }
