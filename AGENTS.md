@@ -16,7 +16,7 @@ This file provides guidance to agents when working with code in this repository.
 - Debug names (`FSM_ENABLE_DEBUG`) required for `fsm_set_state_names()` and `fsm_get_state_name()` to return meaningful strings.
 - Statistics (`FSM_ENABLE_STATS`) must be enabled to use `fsm_get_stats()` and `fsm_clear_stats()`.
 - Trace (`FSM_ENABLE_TRACE`) must be enabled to use `fsm_get_trace()` and `fsm_clear_trace()`.
-- Assertions (`FSM_ENABLE_ASSERT`) affect `FSM_ASSERT` macro behavior; when disabled, only returns error code without `FSM_BREAK()`.
+- Assertions (`FSM_ENABLE_ASSERT`) affect `FSM_ASSERT` macro behavior; when disabled, only error codes returned without trapping.
 
 ## Code Style Observations
 - Indentation: 2 spaces (observed in source files)

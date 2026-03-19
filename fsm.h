@@ -25,6 +25,29 @@
  *   FSM_ENABLE_HSM        默认 0    层次化状态机（opt-in，行为变更较大）
  *   FSM_EVENT_QUEUE_SIZE  默认 8    必须为 2 的幂
  *   FSM_TRACE_BUFFER_SIZE 默认 16
+ *
+ * @par 时序差异（Flat vs HSM）
+ *
+ * 本框架支持两种模式：Flat（平面状态机）和 HSM（层次化状态机）。
+ * 两种模式在状态转换时的回调触发时序有重要差异：
+ *
+ * @par Flat 模式（FSM_ENABLE_HSM=0）
+ *   - 状态转换在 fsm_step() 中的 handler 返回后执行
+ *   - on_exit/on_entry 回调在下一次 fsm_step() 开头触发
+ *   - 时序：handler → fsm_do_transition() → 下一次 fsm_step() → fsm_handle_state_entry() → 回调
+ *   - 特点：回调延迟到下一次 fsm_step()，适合需要延迟处理的场景
+ *
+ * @par HSM 模式（FSM_ENABLE_HSM=1）
+ *   - 状态转换在 fsm_step() 中的 handler 返回后立即执行
+ *   - on_exit/on_entry 回调在转换时同步触发
+ *   - 时序：handler → fsm_hsm_perform_transition() → 回调（同步）→ fsm_do_transition()
+ *   - 特点：回调立即触发，符合 UML 状态图语义，适合需要即时响应的场景
+ *
+ * @par 重要注意事项
+ *   - 两种模式的回调时序不同，迁移时需要注意
+ *   - HSM 模式下，回调在 handler 返回后立即触发，不会延迟到下一次 fsm_step()
+ *   - 如果需要在回调中修改状态，HSM 模式下会立即生效，Flat 模式下会延迟生效
+ *   - 统计信息（enter_count, total_ticks 等）在两种模式下的更新时序相同
  */
 
 #ifndef FSM_H

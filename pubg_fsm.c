@@ -23,28 +23,28 @@
 /* 状态名 */
 static const char * const PUBGM_STATE_NAMES[ST_COUNT] =
 {
-    "MENU",
-    "MATCHMAKING",
-    "LOADING",
-    "PARACHUTE",
-    "DROP_SELECTION",
-    "FALLING",
-    "LANDING",
-    "IN_GAME",
-    "SAFE_ZONE",
-    "COMBAT",
-    "ENEMY_SQUAD_A",
-    "ENEMY_SQUAD_B",
-    "ENEMY_SQUAD_C",
-    "LOOTING",
-    "AIRDROP",
-    "TEAMMATE",
-    "RANDOM_EVENT",
-    "KNOCKED",
-    "REVIVING",
-    "WIN",
-    "LOSE",
-    "SUMMARY",
+    "菜单",
+    "匹配中",
+    "加载中",
+    "跳伞",
+    "选择落点",
+    "下落",
+    "着陆",
+    "游戏中",
+    "安全区",
+    "战斗",
+    "敌方小队A",
+    "敌方小队B",
+    "敌方小队C",
+    "搜刮物资",
+    "空投",
+    "队友",
+    "随机事件",
+    "被击倒",
+    "复活中",
+    "胜利",
+    "失败",
+    "总结",
 };
 
 /* 日志 */
@@ -657,6 +657,7 @@ static void advance_ticks(uint32_t ticks)
     for (uint32_t i = 0; i < ticks; i++)
     {
         g_pubg_tick++;
+        g_pubg_data.tick_count++;
         fsm_step(&g_pubg_fsm);
     }
 }

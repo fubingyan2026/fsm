@@ -16,3 +16,7 @@ build/
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
+.cache/clangd/index/fsm.c.1C1E0424B0B68C49.idx
+.cache/clangd/index/fsm.h.C947BB8C574D7E82.idx
+.cache/clangd/index/pubg_fsm.c.7EE73136366B3740.idx
+.cache/clangd/index/pubg_fsm.h.5DCA28B2F968B918.idx
